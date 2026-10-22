@@ -1,0 +1,28 @@
+{
+ "domino-kapo": {
+  "name": "Domino -> OpenLDAP (Kapo)",
+  "interval": "0",
+  "verify_tls": true,
+  "src_host": "domino.example.com",
+  "src_port": "636",
+  "src_ssl": true,
+  "src_user": "CN=ldapreader/O=Firma",
+  "src_pw": "CHANGE-ME",
+  "src_base": "O=Extern",
+  "src_filter": "(&(objectClass=dominoPerson)(mail=*@example.org))",
+  "src_scope": "sub",
+  "dst_host": "openldap.example.com",
+  "dst_port": "636",
+  "dst_ssl": true,
+  "dst_user": "cn=admin,dc=example,dc=com",
+  "dst_pw": "CHANGE-ME",
+  "dst_base": "ou=Kapo,dc=example,dc=com",
+  "key_attr": "uid",
+  "object_classes": "top,person,organizationalPerson,inetOrgPerson",
+  "mapping": "uid=uid|mail:local\ncn=cn\nsn=sn\ngivenName=givenName\ndisplayName=displayName|cn\nmail=mail\ntelephoneNumber=telephoneNumber\nmobile=mobile\ntitle=title",
+  "remove_missing": true,
+  "marker_attr": "employeeType",
+  "marker_value": "synced-from-domino",
+  "delete_orphans": false
+ }
+}

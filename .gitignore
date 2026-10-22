@@ -1,0 +1,10 @@
+# Enthaelt Passwoerter im Klartext - nie committen
+jobs.json
+.env
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/

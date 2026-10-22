@@ -1,0 +1,14 @@
+services:
+  ldap-sync:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${UI_PORT:-5000}:5000"
+    environment:
+      UI_USER: ${UI_USER:?UI_USER in .env setzen}
+      UI_PASS: ${UI_PASS:?UI_PASS in .env setzen}
+    volumes:
+      - ldap-sync-data:/data
+
+volumes:
+  ldap-sync-data:
