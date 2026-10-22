@@ -5,9 +5,21 @@ services:
     ports:
       - "${UI_PORT:-5000}:5000"
     environment:
-      UI_USER: ${UI_USER:?UI_USER in .env setzen}
-      UI_PASS: ${UI_PASS:?UI_PASS in .env setzen}
+      # Zeitzone fuer die Cron-Zeitplaene der Jobs (Feld "Zeitplan" in der Oberflaeche).
+      # Der Zeitplaner laeuft im Container mit - ein Host-Cron ist nicht noetig.
+      TZ: ${TZ:-Europe/Zurich}
+      # Optional: legt beim allerersten Start den ersten Benutzer an.
+      # Leer lassen, um ihn im Browser ueber /setup anzulegen.
+      UI_USER: ${UI_USER:-}
+      UI_PASS: ${UI_PASS:-}
+      # Optional: fester Schluessel fuer Session-Cookies (sonst wird er im Volume erzeugt)
+      SECRET_KEY: ${SECRET_KEY:-}
+      # Nur auf 1 setzen, wenn die Seite ausschliesslich ueber HTTPS erreichbar ist
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+      # Auf 1 setzen, wenn ein Reverse-Proxy (nginx, Traefik, ...) davorsteht
+      BEHIND_PROXY: ${BEHIND_PROXY:-0}
     volumes:
+      # enthaelt jobs.json, users.json und .secret_key
       - ldap-sync-data:/data
 
 volumes:

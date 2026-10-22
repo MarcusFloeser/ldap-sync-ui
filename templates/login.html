@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>LDAP Sync – {% if mode == 'setup' %}Einrichtung{% else %}Anmelden{% endif %}</title>
+  <link rel="stylesheet" href="{{ asset('style.css') }}">
+</head>
+<body class="auth">
+  <main class="auth-card">
+    <div class="brand big"><span class="logo">LS</span><h1>LDAP Sync</h1></div>
+    {% if mode == 'setup' %}
+      <p class="muted">Erstmalige Einrichtung: Lege den ersten Benutzer an.</p>
+    {% else %}
+      <p class="muted">Bitte melde dich an.</p>
+    {% endif %}
+
+    {% if error %}<div class="alert" role="alert">{{ error }}</div>{% endif %}
+
+    <form method="post" class="stack">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <label class="field">
+        <span class="lbl">Benutzername</span>
+        <input name="username" value="{{ username or '' }}" required {% if not username %}autofocus{% endif %} maxlength="64" autocomplete="username" spellcheck="false">
+      </label>
+      <label class="field">
+        <span class="lbl">Passwort</span>
+        <input type="password" name="password" required {% if username %}autofocus{% endif %}
+               autocomplete="{% if mode == 'setup' %}new-password{% else %}current-password{% endif %}">
+      </label>
+      {% if mode == 'setup' %}
+        <label class="field">
+          <span class="lbl">Passwort wiederholen</span>
+          <input type="password" name="password2" required autocomplete="new-password">
+          <span class="hint">Mindestens 8 Zeichen.</span>
+        </label>
+      {% endif %}
+      <button class="btn primary wide" type="submit">
+        {% if mode == 'setup' %}Benutzer anlegen{% else %}Anmelden{% endif %}
+      </button>
+    </form>
+  </main>
+</body>
+</html>

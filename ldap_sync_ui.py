@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """
-Universeller LDAP-Sync mit Web-Oberflaeche.
+LDAP Sync UI - universeller LDAP-Sync mit Web-Oberflaeche, Login und Zeitplan.
 
-Installation:  pip install flask ldap3
-Start (Web):   python ldap_sync_ui.py                -> http://127.0.0.1:5000
-Headless/Cron: python ldap_sync_ui.py --run <job-id> [--dry-run]
+Installation:  pip install -r requirements.txt
+Start (Web):   python ldap_sync_ui.py                 -> http://127.0.0.1:5000
+Headless:      python ldap_sync_ui.py --run <job-id> [--dry-run]
+Benutzer:      python ldap_sync_ui.py --add-user <name>   (legt an / setzt Passwort)
 
 Umgebungsvariablen:
-  UI_HOST (127.0.0.1)  UI_PORT (5000)  UI_USER / UI_PASS (Basic-Auth, empfohlen)
-  SYNC_DATA (jobs.json) = Datei mit den Job-Definitionen (enthaelt Passwoerter!)
+  UI_HOST (127.0.0.1)   UI_PORT (5000)
+  SYNC_DATA   (jobs.json)  Pfad der Job-Datei; users.json und .secret_key
+                           liegen im selben Ordner
+  UI_USER / UI_PASS        optional: legt beim ersten Start den ersten Benutzer an
+                           (sonst Einrichtung ueber /setup im Browser)
+  SECRET_KEY               optional: Schluessel fuer Session-Cookies
+                           (sonst wird .secret_key im Datenordner erzeugt)
+  COOKIE_SECURE=1          Session-Cookie nur ueber HTTPS senden (hinter HTTPS-Proxy)
+  BEHIND_PROXY=1           X-Forwarded-* eines vorgeschalteten Reverse-Proxys beachten
+  SESSION_HOURS (8)        Gueltigkeit der Anmeldung
+  TZ                       Zeitzone fuer Cron-Zeitplaene (z.B. Europe/Zurich)
 
 Mapping-Syntax (eine Zeile pro Zielattribut):
   ziel=quelle                 Attribut kopieren
@@ -17,41 +27,119 @@ Mapping-Syntax (eine Zeile pro Zielattribut):
   ziel='festerwert'           Konstante
 """
 import argparse
+import getpass
 import hmac
 import json
 import os
+import re
+import secrets
 import ssl
 import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta
 
-from flask import Flask, Response, jsonify, request
+from croniter import croniter
+from flask import (Flask, jsonify, redirect, render_template, request,
+                   session, url_for)
 from ldap3 import LEVEL, MODIFY_REPLACE, NONE, SUBTREE, Connection, Server, Tls
 from ldap3.core.exceptions import LDAPException
 from ldap3.utils.conv import escape_filter_chars
 from ldap3.utils.dn import escape_rdn
+from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.security import check_password_hash, generate_password_hash
 
-DATA = os.getenv("SYNC_DATA", "jobs.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.abspath(os.getenv("SYNC_DATA", "jobs.json"))
+DATA_DIR = os.path.dirname(DATA)
+USERS = os.path.join(DATA_DIR, "users.json")
+KEYFILE = os.path.join(DATA_DIR, ".secret_key")
 MASK = "********"
-app = Flask(__name__)
-runs, busy, io_lock = {}, set(), threading.Lock()
+USER_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
+MIN_PW = 8
+PW_METHOD = "pbkdf2:sha256"
+
+runs, busy, last_run = {}, {}, {}   # busy: job-id -> run-id
+io_lock = threading.Lock()
+FAILS = {}                          # Login-Fehlversuche je IP
 
 
-# ---------------------------------------------------------------- Jobs
-def load():
+def env_flag(name):
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------- Dateien
+def write_file(path, text):
+    """Atomar schreiben (Rechte 0600); Fallback fuer einzeln gemountete Dateien."""
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        with open(DATA, encoding="utf-8") as f:
-            return json.load(f)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(path, 0o600)
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
+def load():
+    return read_json(DATA)
+
+
 def save(jobs):
     with io_lock:
-        with open(DATA, "w", encoding="utf-8") as f:
-            json.dump(jobs, f, indent=1, ensure_ascii=False)
-        os.chmod(DATA, 0o600)
+        write_file(DATA, json.dumps(jobs, indent=1, ensure_ascii=False))
+
+
+def load_users():
+    return read_json(USERS)
+
+
+def save_users(users):
+    write_file(USERS, json.dumps(users, indent=1, ensure_ascii=False))
+
+
+def add_user(name, pw):
+    with io_lock:
+        users = load_users()
+        users[name] = {"hash": generate_password_hash(pw, method=PW_METHOD)}
+        save_users(users)
+
+
+def load_secret_key():
+    key = os.getenv("SECRET_KEY", "").strip()
+    if key:
+        return key
+    try:
+        with open(KEYFILE, encoding="utf-8") as f:
+            key = f.read().strip()
+        if key:
+            return key
+    except OSError:
+        pass
+    key = secrets.token_hex(32)
+    try:
+        write_file(KEYFILE, key)
+    except OSError:
+        print("WARNUNG: .secret_key nicht schreibbar - Anmeldungen gelten nur bis zum "
+              "Neustart (SECRET_KEY setzen oder Datenordner schreibbar machen).",
+              file=sys.stderr)
+    return key
 
 
 # ---------------------------------------------------------------- LDAP
@@ -115,6 +203,25 @@ def read_src(conn, base, flt, attrs, scope):
         conn.search(base, flt, scope, attributes=attrs)
         for e in entries(conn):
             yield e["dn"], e["attributes"]
+
+
+def validate(job, full=True):
+    """Liste von Problemen (leer = ok)."""
+    need = [("src_host", "Quelle: Host"), ("src_base", "Quelle: Search-Base"),
+            ("src_filter", "Suchfilter"), ("dst_host", "Ziel: Host"),
+            ("dst_base", "Ziel-Base")]
+    if full:
+        need += [("key_attr", "Schluesselattribut"), ("object_classes", "objectClasses"),
+                 ("mapping", "Attribut-Mapping")]
+    problems = [f"{label} fehlt" for k, label in need if not str(job.get(k) or "").strip()]
+    key = str(job.get("key_attr") or "").strip().lower()
+    targets = {d.lower() for d, _ in parse_map(job.get("mapping"))}
+    if full and key and targets and key not in targets:
+        problems.append(f"Das Schluesselattribut '{key}' muss im Mapping als Ziel vorkommen")
+    expr = str(job.get("cron") or "").strip()
+    if expr and not croniter.is_valid(expr):
+        problems.append(f"Ungueltiger Cron-Ausdruck: {expr}")
+    return problems
 
 
 # ---------------------------------------------------------------- Sync
@@ -199,34 +306,67 @@ def run_job(job, dry, rid):
         r["status"] = "error"
 
 
-def start(jid, job, dry):
+def start(jid, job, dry, trigger="manuell"):
     if jid in busy:
         return None
     rid = uuid.uuid4().hex[:8]
-    runs[rid] = {"job": job.get("name", jid), "log": [], "status": "running", "stats": {}}
+    runs[rid] = {"job": job.get("name", jid), "log": [], "status": "running",
+                 "stats": {}, "dry": dry, "trigger": trigger}
     while len(runs) > 50:
         runs.pop(next(iter(runs)))
-    busy.add(jid)
+    busy[jid] = rid
 
     def worker():
         try:
             run_job(job, dry, rid)
+        except Exception:  # sollte nie passieren, run_job faengt alles ab
+            runs.get(rid, {})["status"] = "error"
         finally:
-            busy.discard(jid)
+            r = runs.get(rid, {})
+            last_run[jid] = {"status": r.get("status", "error"), "stats": r.get("stats", {}),
+                             "time": time.strftime("%d.%m.%Y %H:%M"), "dry": dry,
+                             "trigger": trigger, "run": rid}
+            busy.pop(jid, None)
     threading.Thread(target=worker, daemon=True).start()
     return rid
 
 
+def next_run(job):
+    expr = str(job.get("cron") or "").strip()
+    if not expr or not croniter.is_valid(expr):
+        return None
+    nxt = croniter(expr, datetime.now().astimezone()).get_next(datetime)
+    return nxt.strftime("%d.%m.%Y %H:%M")
+
+
 def scheduler():
-    last = {}
+    """Startet Jobs nach Cron-Ausdruck (Vorrang) oder festem Intervall."""
+    last_tick = time.time()
+    last_start = {}
     while True:
-        time.sleep(30)
+        time.sleep(15)
+        now = time.time()
         for jid, j in load().items():
-            m = int(j.get("interval") or 0)
-            t = last.setdefault(jid, time.time())
-            if m > 0 and time.time() - t >= m * 60 and jid not in busy:
-                last[jid] = time.time()
-                start(jid, j, False)
+            if jid in busy:
+                continue
+            expr = str(j.get("cron") or "").strip()
+            try:
+                if expr:
+                    if not croniter.is_valid(expr):
+                        continue
+                    base = datetime.fromtimestamp(last_tick).astimezone()
+                    due = croniter(expr, base).get_next(datetime).timestamp() <= now
+                    if due and not validate(j):
+                        start(jid, j, False, "Zeitplan")
+                else:
+                    mins = int(j.get("interval") or 0)
+                    t = last_start.setdefault(jid, now)
+                    if mins > 0 and now - t >= mins * 60 and not validate(j):
+                        last_start[jid] = now
+                        start(jid, j, False, "Intervall")
+            except (ValueError, TypeError):
+                continue
+        last_tick = now
 
 
 def test(job):
@@ -244,37 +384,232 @@ def test(job):
     return out
 
 
-# ---------------------------------------------------------------- Web/API
+# ---------------------------------------------------------------- Flask
+app = Flask(__name__, static_folder=os.path.join(HERE, "static"),
+            template_folder=os.path.join(HERE, "templates"))
+app.config.update(
+    SESSION_COOKIE_NAME="ldapsync_session",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=env_flag("COOKIE_SECURE"),
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=int(os.getenv("SESSION_HOURS", "8") or 8)),
+    MAX_CONTENT_LENGTH=1024 * 1024,
+)
+if env_flag("BEHIND_PROXY"):
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+DUMMY_HASH = generate_password_hash(secrets.token_hex(8), method=PW_METHOD)
+
+
+def csrf_token():
+    if "csrf" not in session:
+        session["csrf"] = secrets.token_urlsafe(32)
+    return session["csrf"]
+
+
+def asset(name):
+    try:
+        v = int(os.path.getmtime(os.path.join(app.static_folder, name)))
+    except OSError:
+        v = 0
+    return url_for("static", filename=name, v=v)
+
+
+@app.context_processor
+def inject():
+    return {"csrf_token": csrf_token, "asset": asset}
+
+
+def token_ok(sent):
+    expected = session.get("csrf")
+    return bool(expected) and hmac.compare_digest(str(sent or ""), expected)
+
+
+def login_locked(ip):
+    now = time.time()
+    FAILS[ip] = [t for t in FAILS.get(ip, []) if now - t < 600]
+    return len(FAILS[ip]) >= 5
+
+
+def do_login(name):
+    session.clear()
+    session["user"] = name
+    session.permanent = True
+    csrf_token()
+
+
 @app.before_request
-def auth():
-    u, p = os.getenv("UI_USER"), os.getenv("UI_PASS")
-    if u and p:
-        a = request.authorization
-        if not (a and hmac.compare_digest(a.username, u) and hmac.compare_digest(a.password or "", p)):
-            return Response("Login erforderlich", 401, {"WWW-Authenticate": 'Basic realm="ldap-sync"'})
+def guard():
+    ep = request.endpoint
+    if ep in (None, "static"):
+        return None
+    users = load_users()
+    if not users:
+        return None if ep == "setup" else redirect(url_for("setup"))
+    if ep in ("login", "setup"):
+        return None
+    if session.get("user") not in users:
+        session.clear()
+        if request.path.startswith("/api/"):
+            return jsonify(error="Nicht angemeldet"), 401
+        return redirect(url_for("login"))
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if not token_ok(request.headers.get("X-CSRF-Token")):
+            return jsonify(error="Sicherheitspruefung fehlgeschlagen - Seite neu laden"), 403
+    return None
 
 
+@app.after_request
+def secure_headers(resp):
+    h = resp.headers
+    h.setdefault("Content-Security-Policy",
+                 "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("Referrer-Policy", "same-origin")
+    if request.endpoint != "static":
+        h["Cache-Control"] = "no-store"
+    return resp
+
+
+# ---- Seiten
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not load_users():
+        return redirect(url_for("setup"))
+    if session.get("user") in load_users():
+        return redirect(url_for("index"))
+    ip = request.remote_addr or "?"
+    error, status = None, 200
+    posted = request.form.get("username", "").strip() if request.method == "POST" else ""
+    if request.method == "POST":
+        if not token_ok(request.form.get("csrf")):
+            error = "Die Sitzung ist abgelaufen. Bitte erneut versuchen."
+        elif login_locked(ip):
+            error, status = "Zu viele Fehlversuche. Bitte in 10 Minuten erneut versuchen.", 429
+        else:
+            name = request.form.get("username", "").strip()
+            user = load_users().get(name)
+            good = check_password_hash(user["hash"] if user else DUMMY_HASH,
+                                       request.form.get("password", ""))
+            if good and user:
+                FAILS.pop(ip, None)
+                do_login(name)
+                return redirect(url_for("index"))
+            FAILS.setdefault(ip, []).append(time.time())
+            error = "Benutzername oder Passwort falsch."
+    return render_template("login.html", mode="login", error=error, username=posted), status
+
+
+@app.route("/setup", methods=["GET", "POST"])
+def setup():
+    if load_users():
+        return redirect(url_for("login"))
+    error = None
+    posted = request.form.get("username", "").strip() if request.method == "POST" else ""
+    if request.method == "POST":
+        name = posted
+        pw, pw2 = request.form.get("password", ""), request.form.get("password2", "")
+        if not token_ok(request.form.get("csrf")):
+            error = "Die Sitzung ist abgelaufen. Bitte erneut versuchen."
+        elif not USER_RE.match(name):
+            error = "Benutzername: 1-64 Zeichen (Buchstaben, Ziffern, . _ @ -)."
+        elif len(pw) < MIN_PW:
+            error = f"Das Passwort muss mindestens {MIN_PW} Zeichen lang sein."
+        elif pw != pw2:
+            error = "Die Passwoerter stimmen nicht ueberein."
+        else:
+            add_user(name, pw)
+            do_login(name)
+            return redirect(url_for("index"))
+    return render_template("login.html", mode="setup", error=error, username=posted)
+
+
+@app.get("/")
+def index():
+    return render_template("app.html", user=session["user"])
+
+
+# ---- Konto
+@app.post("/api/logout")
+def logout():
+    session.clear()
+    return jsonify(ok=True)
+
+
+@app.post("/api/password")
+def password_change():
+    d = request.get_json(silent=True) or {}
+    user = load_users().get(session["user"])
+    if not user or not check_password_hash(user["hash"], str(d.get("current", ""))):
+        return jsonify(error="Das aktuelle Passwort ist falsch."), 400
+    new = str(d.get("new", ""))
+    if len(new) < MIN_PW:
+        return jsonify(error=f"Das neue Passwort muss mindestens {MIN_PW} Zeichen lang sein."), 400
+    add_user(session["user"], new)
+    return jsonify(ok=True)
+
+
+@app.get("/api/users")
+def users_list():
+    return jsonify(users=sorted(load_users()), me=session["user"])
+
+
+@app.post("/api/users")
+def users_add():
+    d = request.get_json(silent=True) or {}
+    name, pw = str(d.get("name", "")).strip(), str(d.get("password", ""))
+    if not USER_RE.match(name):
+        return jsonify(error="Benutzername: 1-64 Zeichen (Buchstaben, Ziffern, . _ @ -)."), 400
+    if len(pw) < MIN_PW:
+        return jsonify(error=f"Das Passwort muss mindestens {MIN_PW} Zeichen lang sein."), 400
+    if name in load_users():
+        return jsonify(error="Dieser Benutzer existiert bereits."), 409
+    add_user(name, pw)
+    return jsonify(ok=True)
+
+
+@app.delete("/api/users/<name>")
+def users_del(name):
+    with io_lock:
+        users = load_users()
+        if name == session["user"]:
+            return jsonify(error="Der eigene Benutzer kann nicht geloescht werden."), 400
+        if name not in users:
+            return jsonify(error="Unbekannter Benutzer."), 404
+        users.pop(name)
+        save_users(users)
+    return jsonify(ok=True)
+
+
+# ---- Jobs
 @app.get("/api/jobs")
 def jobs_get():
     jobs = load()
-    for j in jobs.values():
+    for jid, j in jobs.items():
         for k in ("src_pw", "dst_pw"):
             if j.get(k):
                 j[k] = MASK
+        j["_last"] = last_run.get(jid)
+        j["_running"] = busy.get(jid)
+        j["_next"] = next_run(j)
     return jsonify(jobs)
 
 
 @app.post("/api/jobs")
 def jobs_save():
-    j, jobs = request.get_json(), load()
-    jid = j.pop("id", None) or uuid.uuid4().hex[:8]
+    j = request.get_json(silent=True)
+    if not isinstance(j, dict):
+        return jsonify(error="Ungueltige Daten"), 400
+    jobs = load()
+    jid = str(j.pop("id", "") or uuid.uuid4().hex[:8])
     old = jobs.get(jid, {})
+    j = {k: v for k, v in j.items() if not k.startswith("_")}
     for k in ("src_pw", "dst_pw"):
         if j.get(k) == MASK:
             j[k] = old.get(k, "")
     jobs[jid] = j
     save(jobs)
-    return jsonify(id=jid)
+    return jsonify(id=jid, warnings=validate(j))
 
 
 @app.delete("/api/jobs/<jid>")
@@ -282,6 +617,7 @@ def jobs_del(jid):
     jobs = load()
     jobs.pop(jid, None)
     save(jobs)
+    last_run.pop(jid, None)
     return jsonify(ok=True)
 
 
@@ -289,108 +625,93 @@ def jobs_del(jid):
 def jobs_run(jid):
     job = load().get(jid)
     if not job:
-        return jsonify(error="unbekannt"), 404
+        return jsonify(error="Unbekannter Job"), 404
+    problems = validate(job)
+    if problems:
+        return jsonify(error="; ".join(problems)), 400
     rid = start(jid, job, request.args.get("dry") == "1")
-    return jsonify(run=rid) if rid else (jsonify(error="Job laeuft bereits"), 409)
+    return jsonify(run=rid) if rid else (jsonify(error="Der Job laeuft bereits"), 409)
 
 
 @app.post("/api/jobs/<jid>/test")
 def jobs_test(jid):
     job = load().get(jid)
-    return jsonify(log=test(job)) if job else (jsonify(error="unbekannt"), 404)
+    if not job:
+        return jsonify(error="Unbekannter Job"), 404
+    problems = validate(job, full=False)
+    if problems:
+        return jsonify(error="; ".join(problems)), 400
+    return jsonify(log=test(job))
 
 
 @app.get("/api/runs/<rid>")
 def runs_get(rid):
-    return jsonify(runs.get(rid, {"log": ["unbekannter Lauf"], "status": "error"}))
+    r = runs.get(rid)
+    if not r:
+        return jsonify(error="Unbekannter Lauf"), 404
+    frm = max(0, request.args.get("from", 0, type=int))
+    return jsonify(status=r["status"], stats=r.get("stats", {}), job=r["job"],
+                   dry=r.get("dry", False), trigger=r.get("trigger", ""),
+                   log=r["log"][frm:], total=len(r["log"]))
 
 
-@app.get("/")
-def index():
-    return Response(HTML, mimetype="text/html")
+# ---------------------------------------------------------------- Start
+def bootstrap_users():
+    if load_users():
+        return
+    name, pw = os.getenv("UI_USER", "").strip(), os.getenv("UI_PASS", "")
+    if name and pw:
+        if USER_RE.match(name) and len(pw) >= MIN_PW:
+            add_user(name, pw)
+            print(f"Benutzer '{name}' aus UI_USER/UI_PASS angelegt.")
+            return
+        print(f"WARNUNG: UI_USER/UI_PASS ungueltig (Passwort mindestens {MIN_PW} Zeichen).",
+              file=sys.stderr)
+    print("HINWEIS: Noch kein Benutzer vorhanden. Der erste Aufruf im Browser oeffnet "
+          "die Einrichtung (/setup) - rufe die Seite zuerst selbst auf.", file=sys.stderr)
 
 
-HTML = r"""<!doctype html><html lang="de"><meta charset="utf-8"><title>LDAP Sync</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-:root{color-scheme:light dark;--b:#8884;--a:#2f6fed}
-body{font:14px system-ui,sans-serif;margin:0;display:flex;height:100vh}
-aside{width:220px;border-right:1px solid var(--b);padding:12px;overflow:auto}
-main{flex:1;padding:16px;overflow:auto;max-width:1200px}
-ul{list-style:none;padding:0;margin:8px 0}li{padding:6px 8px;border-radius:6px;cursor:pointer}
-li.on{background:var(--a);color:#fff}li:hover:not(.on){background:var(--b)}
-label{display:block;margin:6px 0;font-size:12px}label.c{display:flex;gap:6px;align-items:center;font-size:13px}
-input[type=text],input[type=password],textarea{width:100%;box-sizing:border-box;padding:6px;font:inherit;
- border:1px solid var(--b);border-radius:6px;background:transparent;color:inherit}
-textarea{font-family:ui-monospace,monospace}
-h3{margin:18px 0 4px;border-bottom:1px solid var(--b);padding-bottom:4px}
-.cols{display:grid;grid-template-columns:1fr 1fr;gap:28px}.sec{min-width:0}
-@media(max-width:900px){.cols{grid-template-columns:1fr}}
-button{padding:7px 12px;border:1px solid var(--b);border-radius:6px;background:transparent;color:inherit;cursor:pointer;font:inherit}
-button.p{background:var(--a);color:#fff;border-color:var(--a)}
-#bar{position:sticky;bottom:0;padding:10px 0;display:flex;gap:6px;flex-wrap:wrap;background:Canvas}
-pre{background:#8881;padding:10px;border-radius:6px;white-space:pre-wrap;max-height:300px;overflow:auto}
-</style>
-<aside><b>LDAP Sync</b><ul id="list"></ul><button onclick="newJob()">+ Neuer Job</button></aside>
-<main><div id="f"></div>
-<div id="bar"><button class="p" onclick="doSave()">Speichern</button><button onclick="doTest()">Verbindung testen</button>
-<button onclick="doRun(1)">Dry-Run</button><button onclick="doRun(0)">Sync starten</button>
-<button onclick="doDel()" style="margin-left:auto">Loeschen</button></div>
-<h3>Protokoll</h3><pre id="log">-</pre></main>
-<script>
-const F=[["h","Allgemein"],["name","Name"],["interval","Automatisch alle N Minuten (0 = nur manuell)"],["verify_tls","TLS-Zertifikat pruefen","b"],
-["h","Quelle"],["src_host","Host"],["src_port","Port (leer = 389/636)"],["src_ssl","LDAPS","b"],["src_user","Bind-DN"],["src_pw","Passwort","p"],
-["src_base","Search-Base"],["src_filter","Suchfilter (einzige Selektion)"],["src_scope","Scope: sub oder one"],
-["h","Ziel"],["dst_host","Host"],["dst_port","Port (leer = 389/636)"],["dst_ssl","LDAPS","b"],["dst_user","Bind-DN"],["dst_pw","Passwort","p"],
-["dst_base","Ziel-Base (Eintraege landen direkt darunter)"],
-["h","Abbildung"],["key_attr","Schluesselattribut (wird RDN, z.B. uid)"],["object_classes","objectClasses (Komma-getrennt)"],
-["mapping","Attribut-Mapping: ziel=quelle1|quelle2 , ziel=mail:local , ziel='wert'","t"],
-["h","Abgleich"],["remove_missing","Attribute entfernen, die in der Quelle fehlen","b"],
-["marker_attr","Marker-Attribut (zur Erkennung synchronisierter Eintraege)"],["marker_value","Marker-Wert"],
-["delete_orphans","Verwaiste Eintraege im Ziel loeschen (nur mit Marker)","b"]];
-const DEF={interval:"0",verify_tls:true,src_scope:"sub",src_filter:"(objectClass=person)",key_attr:"uid",
-object_classes:"top,person,organizationalPerson,inetOrgPerson",marker_attr:"employeeType",marker_value:"ldap-sync",
-remove_missing:true,mapping:"uid=uid|mail:local\ncn=cn\nsn=sn\ngivenName=givenName\ndisplayName=displayName|cn\nmail=mail\ntelephoneNumber=telephoneNumber"};
-let jobs={},cur=null,timer=null;const $=s=>document.querySelector(s);
-const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-async function api(u,m="GET",b){const r=await fetch(u,{method:m,headers:{"Content-Type":"application/json"},body:b?JSON.stringify(b):undefined});return r.json()}
-async function load(){jobs=await api("/api/jobs");list()}
-function list(){$("#list").innerHTML=Object.entries(jobs).map(([id,j])=>`<li class="${id==cur?"on":""}" onclick="sel('${id}')">${esc(j.name||id)}</li>`).join("")}
-function sel(id){cur=id;form(jobs[id]);list()}
-function newJob(){cur=null;form(DEF);list()}
-function fld([k,l,t],j){return t=="b"?`<label class=c><input type=checkbox data-k="${k}" ${j[k]?"checked":""}> ${l}</label>`:
-t=="t"?`<label>${l}<textarea data-k="${k}" rows=8>${esc(j[k])}</textarea></label>`:
-`<label>${l}<input data-k="${k}" type="${t=="p"?"password":"text"}" value="${esc(j[k])}"></label>`}
-function form(j){const secs=[];F.forEach(f=>f[0]=="h"?secs.push({h:f[1],f:[]}):secs[secs.length-1].f.push(f));
-const box=x=>`<div class=sec><h3>${x.h}</h3>${x.f.map(f=>fld(f,j)).join("")}</div>`;let o="";
-for(let i=0;i<secs.length;i++){const x=secs[i],n=secs[i+1];
-if(x.h=="Quelle"&&n&&n.h=="Ziel"){o+=`<div class=cols>${box(x)}${box(n)}</div>`;i++}else o+=box(x)}
-$("#f").innerHTML=o}
-function read(){const j={};document.querySelectorAll("[data-k]").forEach(e=>j[e.dataset.k]=e.type=="checkbox"?e.checked:e.value);if(cur)j.id=cur;return j}
-async function doSave(){const r=await api("/api/jobs","POST",read());cur=r.id;await load();sel(cur);return cur}
-async function doDel(){if(cur&&confirm("Job loeschen?")){await api("/api/jobs/"+cur,"DELETE");cur=null;await load();$("#f").innerHTML=""}}
-async function doTest(){await doSave();$("#log").textContent="Teste...";const r=await api(`/api/jobs/${cur}/test`,"POST");$("#log").textContent=r.log.join("\n")}
-async function doRun(dry){await doSave();const r=await api(`/api/jobs/${cur}/run?dry=${dry}`,"POST");
-if(!r.run){$("#log").textContent=r.error;return}clearInterval(timer);
-const tick=async()=>{const s=await api("/api/runs/"+r.run);$("#log").textContent=s.log.join("\n")||"...";if(s.status!="running")clearInterval(timer)};
-tick();timer=setInterval(tick,1000)}
-load().then(()=>{const k=Object.keys(jobs);k.length?sel(k[0]):newJob()});
-</script></html>"""
+app.secret_key = load_secret_key()
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
+def main():
+    ap = argparse.ArgumentParser(description="LDAP Sync UI")
     ap.add_argument("--run", metavar="JOB_ID", help="Job headless ausfuehren (z.B. per Cron)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--add-user", metavar="NAME", help="Benutzer anlegen bzw. Passwort setzen")
     a = ap.parse_args()
+
+    if a.add_user:
+        name = a.add_user.strip()
+        if not USER_RE.match(name):
+            sys.exit("Ungueltiger Benutzername (1-64 Zeichen: Buchstaben, Ziffern, . _ @ -)")
+        pw = getpass.getpass("Passwort: ")
+        if len(pw) < MIN_PW:
+            sys.exit(f"Das Passwort muss mindestens {MIN_PW} Zeichen lang sein.")
+        if pw != getpass.getpass("Passwort wiederholen: "):
+            sys.exit("Die Passwoerter stimmen nicht ueberein.")
+        add_user(name, pw)
+        print(f"Benutzer '{name}' gespeichert ({USERS}).")
+        return
+
     if a.run:
         job = load().get(a.run)
         if not job:
             sys.exit(f"Job '{a.run}' nicht gefunden in {DATA}")
-        rid = start(a.run, job, a.dry_run)
+        problems = validate(job)
+        if problems:
+            sys.exit("Job unvollstaendig: " + "; ".join(problems))
+        rid = start(a.run, job, a.dry_run, "Kommandozeile")
         while runs[rid]["status"] == "running":
             time.sleep(0.5)
         print("\n".join(runs[rid]["log"]))
         sys.exit(0 if runs[rid]["status"] == "done" else 1)
+
+    bootstrap_users()
     threading.Thread(target=scheduler, daemon=True).start()
-    app.run(host=os.getenv("UI_HOST", "127.0.0.1"), port=int(os.getenv("UI_PORT", "5000")))
+    app.run(host=os.getenv("UI_HOST", "127.0.0.1"), port=int(os.getenv("UI_PORT", "5000")),
+            threaded=True)
+
+
+if __name__ == "__main__":
+    main()

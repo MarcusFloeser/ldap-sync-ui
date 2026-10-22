@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <title>LDAP Sync</title>
+  <link rel="stylesheet" href="{{ asset('style.css') }}">
+  <script src="{{ asset('app.js') }}" defer></script>
+</head>
+<body class="app">
+  <header class="topbar">
+    <div class="brand"><span class="logo">LS</span><strong>LDAP Sync</strong></div>
+    <div class="spacer"></div>
+    <span class="who" title="Angemeldet als">{{ user }}</span>
+    <button class="btn ghost" id="btn-users" type="button">Benutzer</button>
+    <button class="btn ghost" id="btn-pw" type="button">Passwort ändern</button>
+    <button class="btn ghost" id="btn-logout" type="button">Abmelden</button>
+  </header>
+
+  <div class="layout">
+    <aside class="side">
+      <div class="side-head">
+        <span>Sync-Jobs</span>
+        <button class="btn small primary" id="btn-new" type="button">+ Neu</button>
+      </div>
+      <ul class="joblist" id="jobs"></ul>
+    </aside>
+
+    <main class="content">
+      <div class="empty" id="empty">
+        <h2>Kein Job ausgewählt</h2>
+        <p class="muted">Wähle links einen Job oder lege einen neuen an.</p>
+        <button class="btn primary" id="btn-new2" type="button">Neuen Job anlegen</button>
+      </div>
+
+      <section id="editor" hidden>
+        <div class="bar">
+          <div class="titleblock">
+            <h2 id="title">Neuer Job</h2>
+            <span class="muted" id="lastinfo"></span>
+          </div>
+          <div class="actions">
+            <button class="btn" id="btn-save" type="button">Speichern</button>
+            <button class="btn" id="btn-test" type="button">Verbindung testen</button>
+            <button class="btn" id="btn-dry" type="button">Dry-Run</button>
+            <button class="btn primary" id="btn-run" type="button">Sync starten</button>
+            <button class="btn danger" id="btn-del" type="button">Löschen</button>
+          </div>
+        </div>
+
+        <div id="form"></div>
+
+        <section class="card" id="result" hidden>
+          <div class="card-head row">
+            <h3 id="result-title">Ergebnis</h3>
+            <span class="badge" id="result-status"></span>
+            <div class="chips" id="chips"></div>
+          </div>
+          <div class="log" id="log" role="log" aria-live="polite"></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="dlg-pw">
+    <form id="f-pw" class="dlg stack" autocomplete="off">
+      <h3>Passwort ändern</h3>
+      <label class="field"><span class="lbl">Aktuelles Passwort</span>
+        <input type="password" name="current" required autocomplete="current-password"></label>
+      <label class="field"><span class="lbl">Neues Passwort</span>
+        <input type="password" name="new" required minlength="8" autocomplete="new-password">
+        <span class="hint">Mindestens 8 Zeichen.</span></label>
+      <label class="field"><span class="lbl">Neues Passwort wiederholen</span>
+        <input type="password" name="new2" required minlength="8" autocomplete="new-password"></label>
+      <p class="alert" id="pw-err" hidden></p>
+      <div class="dlg-actions">
+        <button class="btn" type="button" data-close>Abbrechen</button>
+        <button class="btn primary" type="submit">Speichern</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dlg-users">
+    <div class="dlg stack">
+      <h3>Benutzer</h3>
+      <ul class="userlist" id="userlist"></ul>
+      <form id="f-user" class="stack" autocomplete="off">
+        <h4>Benutzer hinzufügen</h4>
+        <label class="field"><span class="lbl">Benutzername</span>
+          <input name="name" required maxlength="64" autocomplete="off" spellcheck="false"></label>
+        <label class="field"><span class="lbl">Passwort</span>
+          <input type="password" name="password" required minlength="8" autocomplete="new-password">
+          <span class="hint">Mindestens 8 Zeichen.</span></label>
+        <p class="alert" id="user-err" hidden></p>
+        <div class="dlg-actions">
+          <button class="btn" type="button" data-close>Schließen</button>
+          <button class="btn primary" type="submit">Hinzufügen</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+  <div id="toasts" aria-live="polite"></div>
+</body>
+</html>

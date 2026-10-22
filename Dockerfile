@@ -5,11 +5,18 @@ ENV PYTHONUNBUFFERED=1 \
     UI_HOST=0.0.0.0 \
     UI_PORT=5000
 
+# tzdata: damit Cron-Zeitplaene in der per TZ gesetzten Zeitzone laufen
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ldap_sync_ui.py entrypoint.sh ./
+COPY templates templates
+COPY static static
 
 # "sync" existiert im Debian-Basisimage bereits, daher eigener Benutzername
 RUN useradd --system --no-create-home ldapsync \
