@@ -316,7 +316,7 @@ HTML = r"""<!doctype html><html lang="de"><meta charset="utf-8"><title>LDAP Sync
 :root{color-scheme:light dark;--b:#8884;--a:#2f6fed}
 body{font:14px system-ui,sans-serif;margin:0;display:flex;height:100vh}
 aside{width:220px;border-right:1px solid var(--b);padding:12px;overflow:auto}
-main{flex:1;padding:16px;overflow:auto;max-width:900px}
+main{flex:1;padding:16px;overflow:auto;max-width:1200px}
 ul{list-style:none;padding:0;margin:8px 0}li{padding:6px 8px;border-radius:6px;cursor:pointer}
 li.on{background:var(--a);color:#fff}li:hover:not(.on){background:var(--b)}
 label{display:block;margin:6px 0;font-size:12px}label.c{display:flex;gap:6px;align-items:center;font-size:13px}
@@ -324,6 +324,8 @@ input[type=text],input[type=password],textarea{width:100%;box-sizing:border-box;
  border:1px solid var(--b);border-radius:6px;background:transparent;color:inherit}
 textarea{font-family:ui-monospace,monospace}
 h3{margin:18px 0 4px;border-bottom:1px solid var(--b);padding-bottom:4px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:28px}.sec{min-width:0}
+@media(max-width:900px){.cols{grid-template-columns:1fr}}
 button{padding:7px 12px;border:1px solid var(--b);border-radius:6px;background:transparent;color:inherit;cursor:pointer;font:inherit}
 button.p{background:var(--a);color:#fff;border-color:var(--a)}
 #bar{position:sticky;bottom:0;padding:10px 0;display:flex;gap:6px;flex-wrap:wrap;background:Canvas}
@@ -356,9 +358,14 @@ async function load(){jobs=await api("/api/jobs");list()}
 function list(){$("#list").innerHTML=Object.entries(jobs).map(([id,j])=>`<li class="${id==cur?"on":""}" onclick="sel('${id}')">${esc(j.name||id)}</li>`).join("")}
 function sel(id){cur=id;form(jobs[id]);list()}
 function newJob(){cur=null;form(DEF);list()}
-function form(j){$("#f").innerHTML=F.map(([k,l,t])=>k=="h"?`<h3>${l}</h3>`:t=="b"?`<label class=c><input type=checkbox data-k="${k}" ${j[k]?"checked":""}> ${l}</label>`:
+function fld([k,l,t],j){return t=="b"?`<label class=c><input type=checkbox data-k="${k}" ${j[k]?"checked":""}> ${l}</label>`:
 t=="t"?`<label>${l}<textarea data-k="${k}" rows=8>${esc(j[k])}</textarea></label>`:
-`<label>${l}<input data-k="${k}" type="${t=="p"?"password":"text"}" value="${esc(j[k])}"></label>`).join("")}
+`<label>${l}<input data-k="${k}" type="${t=="p"?"password":"text"}" value="${esc(j[k])}"></label>`}
+function form(j){const secs=[];F.forEach(f=>f[0]=="h"?secs.push({h:f[1],f:[]}):secs[secs.length-1].f.push(f));
+const box=x=>`<div class=sec><h3>${x.h}</h3>${x.f.map(f=>fld(f,j)).join("")}</div>`;let o="";
+for(let i=0;i<secs.length;i++){const x=secs[i],n=secs[i+1];
+if(x.h=="Quelle"&&n&&n.h=="Ziel"){o+=`<div class=cols>${box(x)}${box(n)}</div>`;i++}else o+=box(x)}
+$("#f").innerHTML=o}
 function read(){const j={};document.querySelectorAll("[data-k]").forEach(e=>j[e.dataset.k]=e.type=="checkbox"?e.checked:e.value);if(cur)j.id=cur;return j}
 async function doSave(){const r=await api("/api/jobs","POST",read());cur=r.id;await load();sel(cur);return cur}
 async function doDel(){if(cur&&confirm("Job loeschen?")){await api("/api/jobs/"+cur,"DELETE");cur=null;await load();$("#f").innerHTML=""}}
