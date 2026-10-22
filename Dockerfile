@@ -11,8 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ldap_sync_ui.py .
 
-RUN useradd --system --no-create-home sync && mkdir /data && chown sync /data
-USER sync
+# "sync" existiert im Debian-Basisimage bereits, daher eigener Benutzername
+RUN useradd --system --no-create-home ldapsync && mkdir /data && chown ldapsync /data
+USER ldapsync
 VOLUME /data
 EXPOSE 5000
 
